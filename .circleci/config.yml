@@ -1,0 +1,80 @@
+version: 2.1
+
+jobs:
+  build:
+    docker:
+      # 使用 CircleCI 官方 docker 的 golang image，go 版本也跟我們開發的一樣比較保險
+      - image: cimg/go:1.23.6
+
+    working_directory: ~/project
+
+    steps:
+      # 先把專案拉到 docker container 裡
+      - checkout
+      - restore_cache:
+          keys:
+            - go-mod-v4-{{ checksum "go.sum" }}
+      - run:
+          # 安裝套件
+          name: Install Dependencies
+          command: go mod download
+      - save_cache:
+          key: go-mod-v4-{{ checksum "go.sum" }}
+          paths:
+            - "/go/pkg/mod"
+      - run:
+          name: Build the Go application
+          command: |
+            go build -o seminar_api_server .  # 編譯 Go 程式生成名字為 "seminar_api_server" 的可執行 Binary code
+      - persist_to_workspace: # 把輸出的檔案持久化存在一個硬碟空間
+          root: .
+          paths:
+            - seminar_api_server
+  deploy:
+    docker:
+      # 使用 python 方便以後安裝 ansible 來處理事情
+      - image: cimg/python:3.13
+
+    working_directory: ~/project
+
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "SHA256:sm0GlIKKPXl2zkfN3ZZxq3QzIMqihcHeXT7yjYcRht4"  # 這是你的公鑰指紋，用來 SSH 登入 EC2
+      - attach_workspace: # 把上面 build 出來的檔案附加進資料夾
+          at: ~/project
+      - run:
+          name: Copy the binary to EC2
+          command: |
+            echo -e "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null" >> ~/.ssh/config
+
+            # 重新命名檔案成一個獨特的檔案
+            mv ~/project/seminar_api_server ~/project/seminar_api_server_${CIRCLE_SHA1}
+            # 複製編譯好的 binary 檔案到 EC2
+            scp ~/project/seminar_api_server_${CIRCLE_SHA1} ubuntu@${EC2_IP}:/var/www/html
+      - run:
+          name: Stop the existing Go application
+          command: |
+            echo "Stopping the current Go application"
+            set +e # 停止發出錯誤訊息
+            ssh ubuntu@${EC2_IP} "pkill -f 'seminar_api_server' || true" # 終止目前正在運行的 api service
+            set -e # 恢復發出錯誤訊息
+            echo "The go application stopped"
+      - run:
+          name: Start the new Go application
+          command: |
+            # 背景執行 Go application
+            ssh ubuntu@${EC2_IP} "nohup /var/www/html/seminar_api_server_${CIRCLE_SHA1} > /dev/null 2>&1 &"
+            echo "The go application started"
+
+workflows:
+  build-deploy: # 這個 workflow 名稱任意取一個容易識別的即可
+    jobs:
+      - build
+      - deploy: # 當我們的 main branch 更新的時候執行最上面 jobs 裡的 deploy 區塊的內容
+          requires:
+            - build # 需要等 build 區塊結束才執行
+          filters:
+            branches:
+              only:
+                - main
